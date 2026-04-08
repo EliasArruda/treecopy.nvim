@@ -1,12 +1,13 @@
 --- @class TreecopyConfig
 --- @field ignore string[] Patterns of files/directories to ignore
 --- @field title string Title used in the Markdown header
---- @field keymap string|false Keyboard shortcut to open the format selector
---- @field max_depth number|nil Maximum recursion depth for the tree
---- @field output_format "markdown" | "yaml" | "plain" | "json" Default output format
---- @field show_hidden boolean Whether to include hidden files (starting with dot)
---- @field icons table Dictionary of glyphs for UI and visual tree
---- @field which_key table Integration settings for which-key.nvim
+--- @field keymap string|false Keyboard shortcut to open the selector
+--- @field max_depth number|nil Maximum recursion depth
+--- @field output_format "markdown" | "yaml" | "plain" | "json" Default format
+--- @field show_hidden boolean Whether to include hidden files
+--- @field root_markers string[] Files that identify the project root
+--- @field icons table Dictionary of glyphs
+--- @field which_key table Integration for which-key.nvim
 
 local M = {}
 
@@ -16,6 +17,7 @@ local M = {}
 
 local default_opts = {
 	ignore = { ".git", "node_modules", "__pycache__", ".next", "dist", ".DS_Store" },
+	root_markers = { ".git", "package.json", "Makefile", "pyproject.toml", ".workspace" },
 	title = "📁 Project File Tree",
 	keymap = "<leader>fq",
 	max_depth = nil,
@@ -24,54 +26,40 @@ local default_opts = {
 	icons = {
 		success = "✅",
 		error = "❌",
-		warning = "⚠️",
-		info = "ℹ️",
-		tree = "🌳",
 		copy = "📋",
+		project = "🏗️",
+		folder = "📂",
 	},
 	which_key = {
 		icon = "🌲",
-		description = "Copy File Tree (Select Format)",
-		group = "Project",
+		description = "Copy File Tree (Select Scope)",
 	},
 }
 
 local config = {}
 
 -- =============================================================================
--- [ DATA SERIALIZERS ]
+-- [ UTILITIES ]
 -- =============================================================================
 
---- Recursive YAML serializer with proper indentation
---- @param data table The node structure
---- @param indent_level number Current depth level
+--- Closes upward to find the project root based on markers
 --- @return string
-local function to_yaml(data, indent_level)
-	indent_level = indent_level or 0
-	local indent = string.rep("  ", indent_level)
-	local lines = {
-		string.format("%s- name: %q", indent, data.name),
-		string.format("%s  type: %s", indent, data.type),
-	}
+local function find_project_root()
+	local current_file = vim.api.nvim_buf_get_name(0)
+	local path = current_file ~= "" and vim.fn.fnamemodify(current_file, ":p:h") or vim.fn.getcwd()
 
-	if data.contents and #data.contents > 0 then
-		table.insert(lines, string.format("%s  contents:", indent))
-		for _, item in ipairs(data.contents) do
-			table.insert(lines, to_yaml(item, indent_level + 2))
-		end
+	local root = vim.fs.find(config.root_markers, { upward = true, path = path })[1]
+	if root then
+		return vim.fn.fnamemodify(root, ":p:h")
 	end
-	return table.concat(lines, "\n")
+	return vim.fn.getcwd() -- Fallback to current working directory
 end
 
---- Pure Lua Pretty-Print JSON Serializer
---- @param obj table Table to convert
---- @param indent string Indentation prefix
---- @return string
+--- Serializers (Pretty JSON & YAML)
 local function pretty_json(obj, indent)
 	indent = indent or ""
 	local next_indent = indent .. "  "
 	local str = ""
-
 	if type(obj) == "table" then
 		local is_array = #obj > 0
 		str = is_array and "[\n" or "{\n"
@@ -89,44 +77,44 @@ local function pretty_json(obj, indent)
 	return str
 end
 
+local function to_yaml(data, indent_level)
+	indent_level = indent_level or 0
+	local indent = string.rep("  ", indent_level)
+	local lines = { string.format("%s- name: %q", indent, data.name), string.format("%s  type: %s", indent, data.type) }
+	if data.contents and #data.contents > 0 then
+		table.insert(lines, string.format("%s  contents:", indent))
+		for _, item in ipairs(data.contents) do
+			table.insert(lines, to_yaml(item, indent_level + 2))
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
 -- =============================================================================
 -- [ DATA EXTRACTION ]
 -- =============================================================================
 
---- Extract tree data using the system 'tree' binary (Performance-optimized)
---- @param root string Root directory
---- @param format string Requested format
---- @return string|nil
 local function fetch_native(root, format)
 	local cmd_parts = { "tree" }
-	-- Force JSON output if structured data is needed
 	if format == "json" or format == "yaml" then
 		table.insert(cmd_parts, "-J")
 	end
 	if config.show_hidden then
 		table.insert(cmd_parts, "-a")
 	end
-
 	table.insert(cmd_parts, "--dirsfirst --noreport")
 	if config.max_depth then
 		table.insert(cmd_parts, "-L " .. tostring(config.max_depth))
 	end
-
 	local ignores = table.concat(config.ignore, "|")
 	if ignores ~= "" then
 		table.insert(cmd_parts, "-I " .. vim.fn.shellescape(ignores))
 	end
 	table.insert(cmd_parts, vim.fn.shellescape(root))
-
 	local output = vim.fn.system(table.concat(cmd_parts, " "))
 	return vim.v.shell_error == 0 and output or nil
 end
 
---- Extract data using Lua's libuv bindings (Fallback mechanism)
---- @param root string Current path
---- @param depth number|nil Max depth
---- @param current_depth number|nil Current recursion depth
---- @return table
 local function fetch_lua_structure(root, depth, current_depth)
 	current_depth = current_depth or 0
 	local node = { name = vim.fn.fnamemodify(root, ":t"), type = "directory", contents = {} }
@@ -134,7 +122,6 @@ local function fetch_lua_structure(root, depth, current_depth)
 	if not handle then
 		return node
 	end
-
 	while true do
 		local name, ftype = vim.loop.fs_scandir_next(handle)
 		if not name then
@@ -143,7 +130,6 @@ local function fetch_lua_structure(root, depth, current_depth)
 		if not config.show_hidden and name:sub(1, 1) == "." then
 			goto continue
 		end
-
 		local ignored = false
 		for _, p in ipairs(config.ignore) do
 			if name:match(p) then
@@ -154,7 +140,6 @@ local function fetch_lua_structure(root, depth, current_depth)
 		if ignored then
 			goto continue
 		end
-
 		if ftype == "directory" then
 			if not depth or (current_depth + 1 < depth) then
 				table.insert(node.contents, fetch_lua_structure(root .. "/" .. name, depth, current_depth + 1))
@@ -169,7 +154,6 @@ local function fetch_lua_structure(root, depth, current_depth)
 	return node
 end
 
---- Generate ASCII visual tree using Lua
 local function fetch_lua_visual(root, depth, current_depth)
 	current_depth = current_depth or 0
 	local result = {}
@@ -177,7 +161,6 @@ local function fetch_lua_visual(root, depth, current_depth)
 	if not handle then
 		return result
 	end
-
 	while true do
 		local name, ftype = vim.loop.fs_scandir_next(handle)
 		if not name then
@@ -186,7 +169,6 @@ local function fetch_lua_visual(root, depth, current_depth)
 		if not config.show_hidden and name:sub(1, 1) == "." then
 			goto continue
 		end
-
 		local ignored = false
 		for _, p in ipairs(config.ignore) do
 			if name:match(p) then
@@ -197,10 +179,8 @@ local function fetch_lua_visual(root, depth, current_depth)
 		if ignored then
 			goto continue
 		end
-
 		local icon = ftype == "directory" and "📁" or "📄"
 		table.insert(result, string.format("%s├── %s %s", string.rep("│   ", current_depth), icon, name))
-
 		if ftype == "directory" and (not depth or current_depth + 1 < depth) then
 			vim.list_extend(result, fetch_lua_visual(root .. "/" .. name, depth, current_depth + 1))
 		end
@@ -210,42 +190,35 @@ local function fetch_lua_visual(root, depth, current_depth)
 end
 
 -- =============================================================================
--- [ CORE LOGIC ]
+-- [ CORE EXECUTION ]
 -- =============================================================================
 
---- Core function to copy the tree to the system clipboard
---- @param opts TreecopyConfig|nil Overrides for this specific call
 function M.copy_tree(opts)
 	local run_conf = vim.tbl_deep_extend("force", config, opts or {})
-	local root = run_conf.root or vim.fn.getcwd()
+	local root = run_conf.root or find_project_root()
 	local fmt = run_conf.output_format
 	local data
 
-	-- Try native binary first
 	if vim.fn.executable("tree") == 1 then
 		data = fetch_native(root, fmt)
 	end
-
-	-- Fallback to Lua implementation if native fails or is missing
 	if not data or data == "" then
 		data = (fmt == "json" or fmt == "yaml") and fetch_lua_structure(root, run_conf.max_depth)
 			or fetch_lua_visual(root, run_conf.max_depth)
 	end
 
-	local final_output = ""
+	local final = ""
 	if fmt == "json" then
 		local obj = type(data) == "string" and vim.json.decode(data) or data
-		final_output = pretty_json(obj)
+		final = pretty_json(obj)
 	elseif fmt == "yaml" then
 		local obj = type(data) == "string" and vim.json.decode(data) or data
-		-- 'tree -J' returns an array; we target the root object
-		local target = type(obj) == "table" and (obj[1] or obj) or obj
-		final_output = to_yaml(target)
+		final = to_yaml(type(obj) == "table" and (obj[1] or obj) or obj)
 	elseif fmt == "plain" then
-		final_output = type(data) == "table" and table.concat(data, "\n") or data
-	else -- Markdown (Default)
+		final = type(data) == "table" and table.concat(data, "\n") or data
+	else
 		local tree_str = type(data) == "table" and table.concat(data, "\n") or data
-		final_output = string.format(
+		final = string.format(
 			"# %s\n\n**Root:** `%s`\n\n```text\n%s\n```\n\n_Generated by treecopy.nvim_ 🌲",
 			run_conf.title,
 			root,
@@ -253,12 +226,7 @@ function M.copy_tree(opts)
 		)
 	end
 
-	-- Copy to system clipboard
-	vim.fn.setreg("+", final_output)
-	if vim.fn.has("unix") == 1 then
-		vim.fn.setreg("*", final_output)
-	end
-
+	vim.fn.setreg("+", final)
 	vim.notify(
 		"Copied as " .. fmt:upper() .. "!",
 		vim.log.levels.INFO,
@@ -266,29 +234,44 @@ function M.copy_tree(opts)
 	)
 end
 
---- Open an interactive UI selector to choose the output format
-function M.select_format_and_copy()
-	local formats = { "markdown", "json", "yaml", "plain" }
-	vim.ui.select(formats, {
-		prompt = "🌲 Select output format for the file tree:",
+--- Multi-step UI Selector
+function M.select_and_copy()
+	local scopes = {
+		{ label = "Project Root", icon = config.icons.project, root = find_project_root() },
+		{ label = "Current Directory", icon = config.icons.folder, root = vim.fn.expand("%:p:h") },
+	}
+
+	vim.ui.select(scopes, {
+		prompt = "🌲 Step 1: Select Scope",
 		format_item = function(item)
-			return "Copy as " .. item:upper()
+			return item.icon .. " " .. item.label
 		end,
-	}, function(choice)
-		if choice then
-			M.copy_tree({ output_format = choice })
+	}, function(scope_choice)
+		if not scope_choice then
+			return
 		end
+
+		local formats = { "markdown", "json", "yaml", "plain" }
+		vim.ui.select(formats, {
+			prompt = string.format("🌲 Step 2: Select Format (%s)", scope_choice.label),
+			format_item = function(item)
+				return "Copy as " .. item:upper()
+			end,
+		}, function(fmt_choice)
+			if fmt_choice then
+				M.copy_tree({ root = scope_choice.root, output_format = fmt_choice })
+			end
+		end)
 	end)
 end
 
 -- =============================================================================
--- [ PLUGIN SETUP ]
+-- [ SETUP ]
 -- =============================================================================
 
 function M.setup(opts)
 	config = vim.tbl_deep_extend("force", default_opts, opts or {})
 
-	-- Register User Commands
 	vim.api.nvim_create_user_command("TreeCopy", function(args)
 		local f = (args.args ~= "") and args.args or config.output_format
 		M.copy_tree({ output_format = f })
@@ -297,23 +280,21 @@ function M.setup(opts)
 		complete = function()
 			return { "markdown", "json", "yaml", "plain" }
 		end,
-		desc = "Copy project tree to clipboard",
 	})
 
-	-- Integration with Which-Key (V3+)
 	local has_wk, wk = pcall(require, "which-key")
 	if has_wk and config.keymap then
 		wk.add({
 			{
 				config.keymap,
-				M.select_format_and_copy,
+				M.select_and_copy,
 				desc = config.which_key.description,
 				icon = config.which_key.icon,
 				mode = "n",
 			},
 		})
 	elseif config.keymap then
-		vim.keymap.set("n", config.keymap, M.select_format_and_copy, { desc = config.which_key.description })
+		vim.keymap.set("n", config.keymap, M.select_and_copy, { desc = config.which_key.description })
 	end
 end
 
